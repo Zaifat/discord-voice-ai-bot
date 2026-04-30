@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Project caches & temporary
+debug/
+debug_audio/
+memory_db/
+models/whisper/
+models/piper/
+models/*.pt
+
+# Logs
+*.log
+*.err
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,27 @@
+# Discord
+discord.py[voice]==2.7.1
+discord-ext-voice-recv>=0.5.3a180   # установится с https://abetlen.github.io/...
+
+# Audio / DSP
+numpy>=1.26
+scipy>=1.13
+onnxruntime>=1.17
+
+# Speech-to-Text (faster-whisper, GPU through CUDA wheels)
+faster-whisper>=1.0
+nvidia-cublas-cu12     # CUDA DLLs for Blackwell/Ampere etc
+nvidia-cudnn-cu12
+
+# LLM (Anthropic Claude API)
+anthropic>=0.40
+
+# TTS (Yandex SpeechKit — over HTTP)
+aiohttp>=3.10
+
+# Memory / vector search (ChromaDB + Ollama embeddings)
+chromadb>=0.5
+ollama>=0.6
+
+# Utilities
+python-dotenv>=1.0
+num2words>=0.5         # цифры → слова для TTS
