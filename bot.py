@@ -64,7 +64,7 @@ class GuildState:
     __slots__ = ("vc", "history", "ltm", "speaking", "audio_q", "worker_task",
                  "user_segmenters", "user_leftovers", "user_frame_count",
                  "last_speaker_id", "interrupt_requested", "mode",
-                 "passive_chance")
+                 "passive_chance", "last_reply_at")
     def __init__(self):
         self.vc: voice_recv.VoiceRecvClient | None = None
         self.history: ConversationHistory = ConversationHistory(max_messages=20)
