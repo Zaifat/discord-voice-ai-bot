@@ -38,7 +38,7 @@
 ## Установка
 
 ```bash
-git clone https://github.com/<your-username>/voice-ai-bot.git
+git clone https://github.com/Zaifat/discord-voice-ai-bot.git
 cd voice-ai-bot
 python setup.py
 ```
