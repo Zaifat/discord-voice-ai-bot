@@ -65,9 +65,12 @@ class GuildState:
                  "user_segmenters", "user_leftovers", "user_frame_count",
                  "last_speaker_id", "interrupt_requested", "mode",
                  "passive_chance", "last_reply_at")
-    def __init__(self):
+    def __init__(self, guild_id: int = 0):
         self.vc: voice_recv.VoiceRecvClient | None = None
-        self.history: ConversationHistory = ConversationHistory(max_messages=20)
+        # max=30 + загрузка последних 30 реплик из JSONL при запуске
+        self.history: ConversationHistory = ConversationHistory(
+            max_messages=30, guild_id=guild_id
+        )
         self.ltm: LongTermMemory = _shared_ltm
         self.speaking: bool = False
         self.audio_q: asyncio.Queue | None = None
@@ -92,7 +95,7 @@ _states: dict[int, GuildState] = {}
 
 def _state(guild_id: int) -> GuildState:
     if guild_id not in _states:
-        _states[guild_id] = GuildState()
+        _states[guild_id] = GuildState(guild_id=guild_id)
     return _states[guild_id]
 
 
@@ -266,20 +269,25 @@ async def _handle_phrase(guild_id: int, user_id: int, user_name: str, audio: np.
         st.history.add_user(user_name, text)
         return
 
-    # 2. Memory: сохраняем в RAM-историю; vector search ОТКЛЮЧЁН в hot-path
-    # потому что bge-m3 и gemma3 делят VRAM в Ollama — каждый embed выгружает LLM.
-    # Долгосрочная память используется только через !remember/!forget команды.
+    # 2. Memory:
+    #    - RAM-история (краткосрочная) сама дублируется в JSONL (persistent log)
+    #    - LTM vector search для семантического recall'a релевантных фактов
     st.history.add_user(user_name, text)
-    memories = []  # await st.ltm.search(guild_id, text, top_k=2)
-    # Сохранять в LTM в фоне можно, не блокирует LLM:
-    # asyncio.create_task(st.ltm.add(guild_id, f"{user_name} сказал: {text}", speaker=user_name))
+    # Парралельно сохраняем в LTM (не блокирует LLM, embed считается в фоне)
+    asyncio.create_task(
+        st.ltm.add(guild_id, f"{user_name}: {text}", speaker=user_name)
+    )
+    # Семантический поиск релевантных воспоминаний
+    memories = await st.ltm.search(guild_id, text, top_k=3, max_distance=0.6)
     memory_block = ""
     if memories:
-        # Берём только реально близкие, и не текущую же реплику
-        relevant = [m for m, _, dist in memories
-                    if dist < 0.5 and text not in m]
+        # Не повторяем текущую же реплику в memory block
+        relevant = [m for m, _, _ in memories if text not in m]
         if relevant:
-            memory_block = "Что ты знаешь:\n" + "\n".join(f"- {m}" for m in relevant)
+            memory_block = "Что ты помнишь о прошлых разговорах:\n" + "\n".join(
+                f"- {m}" for m in relevant[:3]
+            )
+            print(f"  💭 LTM recall: {len(relevant)} фактов", flush=True)
 
     # 3. LLM
     persona = get_persona(guild_id)
@@ -457,9 +465,42 @@ async def personas_cmd(ctx: commands.Context):
 
 
 @bot.command(name="clear", aliases=["очисти"])
-async def clear_cmd(ctx: commands.Context):
-    _state(ctx.guild.id).history.clear()
-    await ctx.send("История очищена.")
+async def clear_cmd(ctx: commands.Context, scope: str | None = None):
+    """!clear        — очистить только RAM-историю (физический лог сохраняется)
+       !clear all    — очистить и RAM, и persistent JSONL-лог"""
+    st = _state(ctx.guild.id)
+    if scope and scope.lower() in ("all", "persistent", "disk"):
+        st.history.clear_persistent()
+        await ctx.send("История очищена полностью (RAM + persistent JSONL).")
+    else:
+        st.history.clear()
+        await ctx.send("RAM-история очищена. Лог на диске сохранён (`!clear all` чтоб удалить).")
+
+
+@bot.command(name="history")
+async def history_cmd(ctx: commands.Context, n: int = 10):
+    """!history [N=10] — показать последние N реплик из persistent log"""
+    from memory.store import _get_chatlog
+    log = _get_chatlog()
+    recs = log.read_last(ctx.guild.id, n)
+    if not recs:
+        await ctx.send("Истории нет.")
+        return
+    lines = []
+    for r in recs:
+        role = r.get("role", "?")
+        name = r.get("name", "")
+        text = r.get("text", "")[:200]
+        if role == "user":
+            lines.append(f"**{name}**: {text}")
+        else:
+            lines.append(f"_(бот)_: {text}")
+    msg = "\n".join(lines)
+    # Discord ограничение 2000 символов
+    if len(msg) > 1900:
+        msg = msg[:1900] + "\n…"
+    total = log.count(ctx.guild.id)
+    await ctx.send(f"**Последние {len(recs)} из {total} реплик:**\n{msg}")
 
 
 @bot.command(name="forget")
@@ -486,13 +527,17 @@ async def status_cmd(ctx: commands.Context):
         "name": f"name — отвечает только если упомянуть имя ({', '.join(_bot_names(ctx.guild.id))})",
         "listener": f"listener — слушает, иногда встревает ({st.passive_chance*100:.0f}% шанс)",
     }.get(st.mode, st.mode)
+    from memory.store import _get_chatlog
+    log_count = _get_chatlog().count(ctx.guild.id)
     await ctx.send(
         f"В голосовом: **{in_voice}** | "
         f"Говорит: **{speaking}** | "
         f"Режим: **{mode_desc}**\n"
-        f"Персона: **{cur.name}** | "
-        f"История: {len(st.history)} реплик | "
-        f"Долгосрочная память: {ltm_stats['total_memories']} фактов"
+        f"Персона: **{cur.name}**\n"
+        f"Память:\n"
+        f"  • краткая (RAM): {len(st.history)} реплик\n"
+        f"  • persistent log: {log_count} записей в `chat_logs/{ctx.guild.id}.jsonl`\n"
+        f"  • долгосрочная (vector): {ltm_stats['total_memories']} воспоминаний в `memory_db/`"
     )
 
 
@@ -523,17 +568,19 @@ async def mode_cmd(ctx: commands.Context, name: str | None = None,
 
 # ─── Прогрев и автозапуск ─────────────────────────────────────────────────────
 async def _warmup_all():
-    """
-    Прогрев тяжёлых моделей.
-    Важно: LLM прогревается ПОСЛЕДНИМ и embeddings НЕ прогреваются —
-    Ollama держит только одну модель в VRAM, embed выгружает gemma.
-    """
+    """Прогрев моделей. LLM на API → можно греть всё подряд, конкуренции за VRAM нет."""
     print("[BOT] Прогрев Whisper...", flush=True)
     await stt_mod.warmup()
     print("[BOT] Прогрев TTS...", flush=True)
     await tts_mod.warmup()
-    print("[BOT] Прогрев LLM (последним — чтобы остался в VRAM)...", flush=True)
+    print("[BOT] Прогрев LLM...", flush=True)
     await llm_mod.warmup()
+    print("[BOT] Прогрев embeddings (для долгосрочной памяти)...", flush=True)
+    try:
+        from memory.store import embed
+        await embed("прогрев")
+    except Exception as e:
+        print(f"[BOT] embed warmup error: {e!r}", flush=True)
     print("[BOT] Все модели прогреты — готов к разговору", flush=True)
 
 

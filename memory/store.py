@@ -1,16 +1,24 @@
 """
 Двухуровневая память:
-1. ConversationHistory — короткая RAM-история последних N реплик per guild
-   (передаётся LLM в каждый запрос как messages list)
-2. LongTermMemory — Chroma vector DB + bge-m3 embeddings через Ollama
-   (поиск релевантных воспоминаний при каждой новой реплике)
+
+1. ConversationHistory — короткая RAM-память последних N реплик per guild.
+   Используется для context window LLM.
+   При создании может загружать последние N реплик из JSONL-лога — диалог
+   продолжается после перезапуска бота.
+
+2. LongTermMemory — Chroma vector DB + bge-m3 embeddings через Ollama.
+   Постоянная (на диске), для семантического поиска.
+
+3. PersistentChatLog — append-only JSONL файл всех реплик. Голый журнал
+   для отладки, ручного просмотра, или восстановления истории.
 """
 from __future__ import annotations
 import asyncio
+import json
 import time
 from collections import deque
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import ollama
 
@@ -20,6 +28,7 @@ from config import ROOT
 # ─── Embeddings via Ollama ────────────────────────────────────────────────────
 EMBED_MODEL = "bge-m3"
 _embed_client: ollama.AsyncClient | None = None
+
 
 def _get_embed_client() -> ollama.AsyncClient:
     global _embed_client
@@ -36,40 +45,130 @@ async def embed(text: str) -> list[float]:
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embeddings для нескольких текстов параллельно."""
     return await asyncio.gather(*(embed(t) for t in texts))
 
 
-# ─── Краткосрочная память: deque ──────────────────────────────────────────────
+# ─── Persistent JSONL chat log ────────────────────────────────────────────────
+class PersistentChatLog:
+    """
+    Append-only JSONL файл всех реплик per guild — chat_logs/<guild_id>.jsonl
+    Каждая строка: {"ts": float, "role": "user|assistant", "name": "...", "text": "..."}
+    """
+    def __init__(self, base_dir: Path | None = None):
+        self.base_dir = base_dir or (ROOT / "chat_logs")
+        self.base_dir.mkdir(exist_ok=True)
+
+    def _path(self, guild_id: int) -> Path:
+        return self.base_dir / f"{guild_id}.jsonl"
+
+    def append(self, guild_id: int, role: str, text: str, name: str = "") -> None:
+        rec = {"ts": time.time(), "role": role, "name": name, "text": text}
+        try:
+            with self._path(guild_id).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[ChatLog] write error: {e!r}", flush=True)
+
+    def read_last(self, guild_id: int, n: int) -> list[dict]:
+        """Прочитать последние n записей."""
+        p = self._path(guild_id)
+        if not p.exists():
+            return []
+        try:
+            lines = p.read_text(encoding="utf-8").strip().splitlines()
+            tail = lines[-n:] if n > 0 else lines
+            return [json.loads(l) for l in tail if l.strip()]
+        except Exception as e:
+            print(f"[ChatLog] read error: {e!r}", flush=True)
+            return []
+
+    def count(self, guild_id: int) -> int:
+        p = self._path(guild_id)
+        if not p.exists():
+            return 0
+        try:
+            with p.open("rb") as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
+    def clear(self, guild_id: int) -> None:
+        p = self._path(guild_id)
+        if p.exists():
+            p.unlink()
+
+
+# Singleton — общий лог между всеми ConversationHistory
+_shared_chatlog: PersistentChatLog | None = None
+
+
+def _get_chatlog() -> PersistentChatLog:
+    global _shared_chatlog
+    if _shared_chatlog is None:
+        _shared_chatlog = PersistentChatLog()
+    return _shared_chatlog
+
+
+# ─── Краткосрочная память: deque + persistent log ─────────────────────────────
 class ConversationHistory:
     """
-    Хранит последние N реплик одного guild.
-    Используется для ContextWindow LLM.
+    Хранит последние N реплик одного guild в RAM (для context window LLM).
+    Параллельно дублирует ВСЕ реплики в persistent JSONL-лог.
+
+    При создании с guild_id ≠ 0 — загружает последние max_messages записей
+    из JSONL чтобы продолжить диалог после перезапуска.
     """
-    def __init__(self, max_messages: int = 20):
+    def __init__(self, max_messages: int = 30, guild_id: int = 0):
         self._messages: deque[dict] = deque(maxlen=max_messages)
+        self._guild_id = guild_id
+        self._last_speaker = ""
+
+        if guild_id:
+            # Загружаем "хвост" истории с диска
+            self._restore_from_log()
+
+    def _restore_from_log(self) -> None:
+        log = _get_chatlog()
+        recs = log.read_last(self._guild_id, self._messages.maxlen or 30)
+        for rec in recs:
+            role = rec.get("role")
+            text = rec.get("text", "")
+            if role in ("user", "assistant") and text:
+                self._messages.append({"role": role, "content": text})
+        if recs:
+            print(f"[History] Восстановлено {len(recs)} реплик из chat_logs/{self._guild_id}.jsonl",
+                  flush=True)
+            self._last_speaker = next(
+                (r.get("name", "") for r in reversed(recs) if r.get("role") == "user"), ""
+            )
 
     def add_user(self, speaker_name: str, text: str) -> None:
-        # Чистый content без "Имя:" префикса — иначе LLM думает что его зовут так же.
-        # Текущий говорящий передаётся отдельно через system prompt в bot.py.
-        self._messages.append({
-            "role": "user",
-            "content": text,
-        })
+        self._messages.append({"role": "user", "content": text})
         self._last_speaker = speaker_name
-
-    @property
-    def last_speaker(self) -> str:
-        return getattr(self, "_last_speaker", "")
+        if self._guild_id:
+            _get_chatlog().append(self._guild_id, "user", text, name=speaker_name)
 
     def add_assistant(self, text: str) -> None:
         self._messages.append({"role": "assistant", "content": text})
+        if self._guild_id:
+            _get_chatlog().append(self._guild_id, "assistant", text, name="bot")
+
+    @property
+    def last_speaker(self) -> str:
+        return self._last_speaker
 
     def get_messages(self) -> list[dict]:
         return list(self._messages)
 
     def clear(self) -> None:
+        """Очищает RAM-историю. На JSONL не влияет."""
         self._messages.clear()
+
+    def clear_persistent(self) -> None:
+        """Также удаляет JSONL-лог (полная очистка)."""
+        self.clear()
+        if self._guild_id:
+            _get_chatlog().clear(self._guild_id)
 
     def __len__(self) -> int:
         return len(self._messages)
@@ -78,8 +177,10 @@ class ConversationHistory:
 # ─── Долгосрочная память: Chroma + bge-m3 ─────────────────────────────────────
 class LongTermMemory:
     """
-    Vector store воспоминаний (per guild). При каждой новой реплике пользователя
-    делаем top-k поиск релевантных воспоминаний и добавляем их в system prompt.
+    Vector store воспоминаний (per guild). При каждой новой реплике делаем
+    top-k поиск релевантных воспоминаний → добавляются в system prompt.
+
+    Полностью persistent: данные хранятся на диске в memory_db/.
     """
     def __init__(self, persist_dir: Path | None = None):
         import chromadb
@@ -91,7 +192,6 @@ class LongTermMemory:
     def _get_coll(self, guild_id: int):
         key = f"guild_{guild_id}"
         if key not in self._collections:
-            # без default ef — embeddings вычисляем сами через Ollama
             self._collections[key] = self._client.get_or_create_collection(
                 name=key,
                 metadata={"hnsw:space": "cosine"},
@@ -101,16 +201,18 @@ class LongTermMemory:
     async def add(self, guild_id: int, text: str,
                   speaker: str | None = None,
                   metadata: dict | None = None) -> None:
-        """Сохранить новое воспоминание (например, ключевой факт о пользователе)."""
         if not text or not text.strip():
             return
         coll = self._get_coll(guild_id)
-        emb = await embed(text)
+        try:
+            emb = await embed(text)
+        except Exception as e:
+            print(f"[LTM] embed error при add: {e!r}", flush=True)
+            return
         ts = time.time()
         meta = {"speaker": speaker or "", "ts": ts}
         if metadata:
             meta.update({k: str(v) for k, v in metadata.items()})
-        # ID — по timestamp + hash, чтобы не дублировалось
         doc_id = f"{int(ts*1000)}_{hash(text) & 0xffff}"
         await asyncio.to_thread(
             coll.add,
@@ -120,14 +222,19 @@ class LongTermMemory:
             metadatas=[meta],
         )
 
-    async def search(self, guild_id: int, query: str, top_k: int = 5) -> list[tuple[str, dict, float]]:
-        """Top-k релевантных воспоминаний. Возвращает [(text, metadata, distance)]."""
+    async def search(self, guild_id: int, query: str, top_k: int = 3,
+                     max_distance: float = 0.6) -> list[tuple[str, dict, float]]:
+        """Top-k релевантных воспоминаний. Фильтрует distance > max_distance."""
         if not query or not query.strip():
             return []
         coll = self._get_coll(guild_id)
         if coll.count() == 0:
             return []
-        emb = await embed(query)
+        try:
+            emb = await embed(query)
+        except Exception as e:
+            print(f"[LTM] embed error при search: {e!r}", flush=True)
+            return []
         result = await asyncio.to_thread(
             coll.query,
             query_embeddings=[emb],
@@ -137,7 +244,8 @@ class LongTermMemory:
         for doc, meta, dist in zip(result["documents"][0],
                                     result["metadatas"][0],
                                     result["distances"][0]):
-            out.append((doc, meta, dist))
+            if dist <= max_distance:
+                out.append((doc, meta, dist))
         return out
 
     def stats(self, guild_id: int) -> dict:
