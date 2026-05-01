@@ -265,8 +265,13 @@ async def _handle_phrase(guild_id: int, user_id: int, user_name: str, audio: np.
 
     # ─── Фильтр режима: should_respond() решает отвечать или просто слушать ──
     if not _should_respond(st, text, user_name):
-        # В режимах name/listener просто сохраняем фразу в историю и выходим
+        # Не отвечаем, но сохраняем фразу:
+        #  - в краткосрочную RAM + persistent JSONL
+        #  - в долгосрочную vector-память (для будущего semantic recall)
         st.history.add_user(user_name, text)
+        asyncio.create_task(
+            st.ltm.add(guild_id, f"{user_name}: {text}", speaker=user_name)
+        )
         return
 
     # 2. Memory:
